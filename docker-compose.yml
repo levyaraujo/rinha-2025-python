@@ -16,7 +16,7 @@ services:
       resources:
         limits:
           cpus: 0.20
-          memory: 40MB
+          memory: 20MB
 
   api1: &api
     build:
@@ -33,7 +33,7 @@ services:
       resources:
         limits:
           cpus: 0.5
-          memory: 105MB
+          memory: 160MB
     environment:
       DEFAULT_PAYMENT_PROCESSOR: "http://payment-processor-default:8080"
       FALLBACK_PAYMENT_PROCESSOR: "http://payment-processor-fallback:8080"
@@ -42,7 +42,12 @@ services:
     <<: *api
     ports:
       - 8082:8080
-  
+    deploy:
+      resources:
+        limits:
+          cpus: 0.5
+          memory: 160MB
+
   cache:
     image: redis:latest
     ports:
@@ -53,7 +58,38 @@ services:
       resources:
         limits:
           cpus: 0.30
-          memory: 100MB
+          memory: 10MB
+  
+  db:
+    container_name: db
+    image: postgres:16.1-alpine
+    environment:
+      - POSTGRES_DB=pyrinha
+      - POSTGRES_USER=pyrinha
+      - POSTGRES_PASSWORD=pyrinha
+    ports:
+      - "5433:5432"
+    volumes:
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+    deploy:
+      resources:
+        limits:
+          cpus: 0.2
+          memory: 150MB
+    command: >
+      postgres
+      -c fsync=off
+      -c work_mem=64MB
+      -c synchronous_commit=off
+      -c wal_level=minimal
+      -c max_wal_senders=0
+    networks:
+      - pyrinha
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U pyrinha -d pyrinha" ]
+      interval: 5s
+      timeout: 5s
+      retries: 10
 
 networks:
   pyrinha:
