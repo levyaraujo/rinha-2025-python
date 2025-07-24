@@ -49,7 +49,7 @@ def get_db_session():
 class Payment(Base):
     __tablename__ = "payments"
 
-    correlationId = Column(UUID, index=True, primary_key=True)
+    correlationId = Column("correlationId", UUID, index=True, primary_key=True)
     processor = Column(String)
     amount = Column(Float)
-    requestedAt = Column(DateTime)
+    requestedAt = Column("requestedAt", DateTime)

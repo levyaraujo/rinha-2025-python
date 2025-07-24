@@ -1,6 +1,6 @@
 services:
   lb:
-    image: nginx:latest
+    image: nginx:alpine
     ports:
       - 9999:9999
 
@@ -11,12 +11,11 @@ services:
     depends_on:
       - api1
       - api2
-
     deploy:
       resources:
         limits:
-          cpus: 0.20
-          memory: 20MB
+          cpus: "0.1"
+          memory: "10MB"
 
   api1: &api
     build:
@@ -32,8 +31,8 @@ services:
     deploy:
       resources:
         limits:
-          cpus: 0.5
-          memory: 160MB
+          cpus: "0.5"
+          memory: "120MB"
     environment:
       DEFAULT_PAYMENT_PROCESSOR: "http://payment-processor-default:8080"
       FALLBACK_PAYMENT_PROCESSOR: "http://payment-processor-fallback:8080"
@@ -45,8 +44,8 @@ services:
     deploy:
       resources:
         limits:
-          cpus: 0.5
-          memory: 160MB
+          cpus: "0.5"
+          memory: "120MB"
 
   cache:
     image: redis:latest
@@ -57,39 +56,44 @@ services:
     deploy:
       resources:
         limits:
-          cpus: 0.30
-          memory: 10MB
+          cpus: "0.2"
+          memory: "40MB"
+    command: >
+      redis-server
+      --maxmemory 35mb
+      --maxmemory-policy allkeys-lru
+      --save ""
+      --appendonly no
   
   db:
     container_name: db
-    image: postgres:16.1-alpine
-    environment:
-      - POSTGRES_DB=pyrinha
-      - POSTGRES_USER=pyrinha
-      - POSTGRES_PASSWORD=pyrinha
-    ports:
-      - "5433:5432"
-    volumes:
-      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+    image: postgres:16-alpine
     deploy:
       resources:
         limits:
-          cpus: 0.2
-          memory: 150MB
+          cpus: "0.2"
+          memory: "60MB"
+    environment:
+      - POSTGRES_SHARED_BUFFERS=16MB
+      - POSTGRES_EFFECTIVE_CACHE_SIZE=32MB
+    networks:
+      - pyrinha
     command: >
       postgres
+      -c shared_buffers=8MB
+      -c effective_cache_size=16MB
+      -c maintenance_work_mem=4MB
+      -c work_mem=2MB
+      -c max_connections=20
       -c fsync=off
-      -c work_mem=64MB
       -c synchronous_commit=off
       -c wal_level=minimal
       -c max_wal_senders=0
-    networks:
-      - pyrinha
-    healthcheck:
-      test: [ "CMD-SHELL", "pg_isready -U pyrinha -d pyrinha" ]
-      interval: 5s
-      timeout: 5s
-      retries: 10
+      -c checkpoint_completion_target=0.9
+      -c random_page_cost=1.1
+      -c log_statement=none
+      -c log_duration=off
+      -c log_lock_waits=off
 
 networks:
   pyrinha:

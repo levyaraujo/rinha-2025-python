@@ -1,12 +1,17 @@
+import asyncio
 import logging
 import os
 from asyncio import Queue
+from typing import List
 
 import httpx
 import redis
 import json
 import traceback
 
+from sqlalchemy import text
+
+from src.buffer import PaymentBuffer
 from src.db import get_db_session, Payment
 from src.schemas import ProcessedPayment
 
@@ -22,6 +27,31 @@ class Cache:
         return self.client.set(key, value)
 
 class PaymentRepo:
+    def save_batch(self, payments: List[ProcessedPayment]):
+        """Ultra-fast batch insert using raw SQL"""
+        if not payments:
+            return
+
+        # Build VALUES clause for all payments
+        values = []
+        params = {}
+
+        for i, payment in enumerate(payments):
+            values.append(f"(:correlation_id_{i}, :processor_{i}, :amount_{i}, :requested_at_{i})")
+            params[f'correlation_id_{i}'] = str(payment.correlationId)
+            params[f'processor_{i}'] = payment.processor
+            params[f'amount_{i}'] = payment.amount
+            params[f'requested_at_{i}'] = payment.requestedAt
+
+        sql = f"""
+            INSERT INTO payments ("correlationId", processor, amount, "requestedAt")
+            VALUES {', '.join(values)}
+            ON CONFLICT ("correlationId") DO NOTHING
+        """
+
+        with get_db_session() as session:
+            session.execute(text(sql), params)
+
     def save(self, payment: ProcessedPayment):
         new_payment = Payment(**payment.to_dict())
         with get_db_session() as session:
@@ -38,36 +68,6 @@ class PaymentRepo:
             for payment in payments:
                 session.delete(payment)
             session.commit()
-
-
-class HealthChecker:
-    def __init__(self, cache: Cache):
-        self.__default_payment_processor = os.getenv("DEFAULT_PAYMENT_PROCESSOR")
-        self.__fallback_payment_processor = os.getenv("FALLBACK_PAYMENT_PROCESSOR")
-        self.cache = cache
-
-    def check_health_default(self):
-        health_url = f"{self.__default_payment_processor}/payments/service-health"
-        try:
-            response = httpx.get(health_url)
-            response.raise_for_status()
-            status = response.json()
-            self.cache.set("health_default", json.dumps(status))
-        except httpx.RequestError:
-            status = {"failing": True, "minResponseTime": float("inf")}
-            self.cache.set("health_default", json.dumps(status))
-
-    def check_health_fallback(self):
-        health_url = f"{self.__fallback_payment_processor}/payments/service-health"
-        try:
-            response = httpx.get(health_url)
-            response.raise_for_status()
-            status = response.json()
-            self.cache.set("health_fallback", json.dumps(status))
-        except httpx.RequestError:
-            status = {"failing": True, "minResponseTime": float("inf")}
-            self.cache.set("health_fallback", json.dumps(status))
-
 
 class PaymentApi:
     def __init__(self, cache: Cache):
@@ -88,64 +88,54 @@ class PaymentApi:
 
 
 class PaymentProcessor:
-    def __init__(self, cache: Cache, api: PaymentApi, repo: PaymentRepo):
-        self.cache = cache
-        self.queue = Queue()
-        self.api = api
+    def __init__(self, health_manager, repo: PaymentRepo):
+        self.health_manager = health_manager
+        self.payment_buffer = PaymentBuffer(repo, batch_size=50, flush_interval=1.5)
         self.repo = repo
-    
-    async def put(self, payment: dict):
-        await self.queue.put(payment)
+        self.client = httpx.AsyncClient(
+            timeout=httpx.Timeout(10.0),
+            limits=httpx.Limits(max_connections=20, max_keepalive_connections=10)
+        )
 
-    async def process(self) -> ProcessedPayment | None:
-        while not self.queue.empty():
-            payment = await self.queue.get()
-            try:
-                health_default = json.loads(self.cache.get("health_default") or '{"failing": true}')
-                health_fallback = json.loads(self.cache.get("health_fallback") or '{"failing": true}')
+    async def process_single_payment(self, payment: dict) -> bool:
+        """Process payment and add to buffer instead of immediate save"""
+        correlation_id = payment['correlationId']
 
+        processor_type = self.health_manager.choose_best_processor()
 
-                if not health_default["failing"]:
-                    try:
-                        status = await self.api.send_payment_default(payment)
-                        logging.info(f"Tentativa default para {payment['correlationId']}: {status}")
-                        
-                        if status == 422:
-                            logging.warning(f"Payment {payment['correlationId']} already exists or invalid")
-                            self.queue.task_done()
-                            continue
-                        
-                        if status == 200:
-                            self.repo.save(ProcessedPayment(processor="default", **payment))
-                            logging.info(f"Salvou {payment['correlationId']} via default")
-                            self.queue.task_done()
-                            continue
-                    except Exception as e:
-                        traceback.print_exc()
-                        logging.error(f"Error sending to default processor: {e}")
-                
-                if not health_fallback["failing"]:
-                    try:
-                        status = await self.api.send_payment_fallback(payment)
-                        logging.info(f"Tentativa fallback para {payment['correlationId']}: {status}")
-                        
-                        if status == 422:
-                            logging.warning(f"Payment {payment['correlationId']} already exists or invalid")
-                            self.queue.task_done()
-                            continue
-                        
-                        if status == 200:
-                            self.repo.save(ProcessedPayment(processor="fallback", **payment))
-                            logging.info(f"Salvou {payment['correlationId']} via fallback")
-                            self.queue.task_done()
-                            continue
-                    except Exception as e:
-                        logging.error(f"Error sending to fallback processor: {e}")
-                
-                if health_default["minResponseTime"] < health_fallback["minResponseTime"]:
-                    status = await self.api.send_payment_fallback(payment)
+        if await self._send_payment(payment, processor_type):
+            processed_payment = ProcessedPayment(
+                processor=processor_type,
+                **payment
+            )
+            await self.payment_buffer.add_payment(processed_payment)
+            return True
 
-                
-            except Exception as e:
-                logging.error(f"Unexpected error processing payment {payment.get('correlationId', 'unknown')}: {e}")
-                self.queue.task_done()
+        alternative = "fallback" if processor_type == "default" else "default"
+        if await self._send_payment(payment, alternative):
+            processed_payment = ProcessedPayment(
+                processor=alternative,
+                **payment
+            )
+            await self.payment_buffer.add_payment(processed_payment)
+            return True
+
+        return False
+
+    async def _send_payment(self, payment: dict, processor_type: str) -> bool:
+        """Send payment to specific processor"""
+        if processor_type == "default":
+            url = "http://payment-processor-default:8080/payments"
+        else:
+            url = "http://payment-processor-fallback:8080/payments"
+
+        try:
+            response = await self.client.post(url, json=payment)
+            return response.status_code == 200
+        except Exception as e:
+            logging.error(f"Error sending to {processor_type}: {e}")
+            return False
+
+    async def shutdown(self):
+        """Ensure all buffered payments are saved before shutdown"""
+        await self.payment_buffer.force_flush()
