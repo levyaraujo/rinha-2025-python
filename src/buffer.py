@@ -2,13 +2,15 @@
 import asyncio
 import logging
 from datetime import datetime, timezone
-from typing import List
+from typing import List, TYPE_CHECKING
 
 from src.schemas import ProcessedPayment
 
+if TYPE_CHECKING:
+    from src.worker import PaymentRepo
 
 class PaymentBuffer:
-    def __init__(self, repo, batch_size=200, flush_interval=2):
+    def __init__(self, repo: "PaymentRepo", batch_size=200, flush_interval=5):
         self.repo = repo
         self.batch_size = batch_size
         self.flush_interval = flush_interval

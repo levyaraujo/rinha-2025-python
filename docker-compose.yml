@@ -25,6 +25,7 @@ services:
       - 8081:8080
     depends_on:
       - cache
+      - db
     networks:
       - pyrinha
       - payment-processor
@@ -74,6 +75,9 @@ services:
           cpus: "0.2"
           memory: "60MB"
     environment:
+      - POSTGRES_DB=pyrinha
+      - POSTGRES_USER=pyrinha
+      - POSTGRES_PASSWORD=pyrinha
       - POSTGRES_SHARED_BUFFERS=16MB
       - POSTGRES_EFFECTIVE_CACHE_SIZE=32MB
     networks:

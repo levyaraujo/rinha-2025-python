@@ -1,14 +1,12 @@
 import asyncio
 import logging
 import os
-from asyncio import Queue
 from typing import List
 
 import httpx
 import redis
-import json
-import traceback
 
+from psycopg2 import IntegrityError, OperationalError
 from sqlalchemy import text
 
 from src.buffer import PaymentBuffer
@@ -26,48 +24,124 @@ class Cache:
     def set(self, key: str, value: str):
         return self.client.set(key, value)
 
+
 class PaymentRepo:
+    def __init__(self):
+        self.retry_delay = 0.1
+        self.max_retries = 3
+
     def save_batch(self, payments: List[ProcessedPayment]):
-        """Ultra-fast batch insert using raw SQL"""
+        """Ultra-reliable batch insert with comprehensive error handling"""
         if not payments:
             return
 
-        # Build VALUES clause for all payments
-        values = []
-        params = {}
+        if self._try_batch_insert(payments):
+            return
 
-        for i, payment in enumerate(payments):
-            values.append(f"(:correlation_id_{i}, :processor_{i}, :amount_{i}, :requested_at_{i})")
-            params[f'correlation_id_{i}'] = str(payment.correlationId)
-            params[f'processor_{i}'] = payment.processor
-            params[f'amount_{i}'] = payment.amount
-            params[f'requested_at_{i}'] = payment.requestedAt
+        logging.warning(
+            f"Batch insert failed, trying individual inserts for {len(payments)} payments"
+        )
+        self._fallback_individual_inserts(payments)
 
-        sql = f"""
-            INSERT INTO payments ("correlationId", processor, amount, "requestedAt")
-            VALUES {', '.join(values)}
-            ON CONFLICT ("correlationId") DO NOTHING
-        """
+    def _try_batch_insert(self, payments: List[ProcessedPayment]) -> bool:
+        """Attempt batch insert with retries"""
+        for attempt in range(self.max_retries):
+            try:
+                values = []
+                params = {}
 
-        with get_db_session() as session:
-            session.execute(text(sql), params)
+                for i, payment in enumerate(payments):
+                    values.append(
+                        f"(:correlation_id_{i}, :processor_{i}, :amount_{i}, :requested_at_{i})"
+                    )
+                    params[f"correlation_id_{i}"] = str(payment.correlationId)
+                    params[f"processor_{i}"] = payment.processor
+                    params[f"amount_{i}"] = payment.amount
+                    params[f"requested_at_{i}"] = payment.requestedAt
 
-    def save(self, payment: ProcessedPayment):
-        new_payment = Payment(**payment.to_dict())
-        with get_db_session() as session:
-            session.add(new_payment)
+                sql = f"""
+                    INSERT INTO payments ("correlationId", processor, amount, "requestedAt")
+                    VALUES {", ".join(values)}
+                    ON CONFLICT ("correlationId") DO NOTHING
+                """
+
+                with get_db_session() as session:
+                    result = session.execute(text(sql), params)
+                    if result.rowcount >= 0:
+                        return True
+
+            except (IntegrityError, OperationalError) as e:
+                logging.warning(f"Batch insert attempt {attempt + 1} failed: {e}")
+                if attempt < self.max_retries - 1:
+                    asyncio.get_event_loop().run_until_complete(
+                        asyncio.sleep(self.retry_delay * (attempt + 1))
+                    )
+                continue
+            except Exception as e:
+                logging.error(f"Unexpected error in batch insert: {e}")
+                self._fallback_individual_inserts(payments)
+                return True
+        logging.info(f"Enviou mas não salvou: {len(payments)}")
+        return False
+
+    def _fallback_individual_inserts(self, payments: List[ProcessedPayment]):
+        """Fallback to individual inserts if batch fails"""
+        failed_payments = []
+
+        for payment in payments:
+            try:
+                with get_db_session() as session:
+                    existing = (
+                        session.query(Payment)
+                        .filter(Payment.correlationId == str(payment.correlationId))
+                        .first()
+                    )
+
+                    if not existing:
+                        new_payment = Payment(
+                            correlationId=str(payment.correlationId),
+                            processor=payment.processor,
+                            amount=payment.amount,
+                            requestedAt=payment.requestedAt,
+                        )
+                        session.add(new_payment)
+                        session.commit()
+
+            except Exception as e:
+                logging.error(
+                    f"Failed to save individual payment {payment.correlationId}: {e}"
+                )
+                failed_payments.append(payment)
+
+        if failed_payments:
+            logging.critical(
+                f"Permanently failed to save {len(failed_payments)} payments"
+            )
 
     def get_all(self):
-        with get_db_session() as session:
-            payments = session.query(Payment).all()
-            return [ProcessedPayment.model_validate(payment) for payment in payments]
+        """Get all payments with error handling"""
+        try:
+            with get_db_session() as session:
+                payments = session.query(Payment).all()
+                return [
+                    ProcessedPayment.model_validate(payment) for payment in payments
+                ]
+        except Exception as e:
+            logging.error(f"Failed to retrieve payments: {e}")
+            return []
 
     def purge(self):
-        with get_db_session() as session:
-            payments = session.query(Payment).all()
-            for payment in payments:
-                session.delete(payment)
-            session.commit()
+        """Purge all payments with verification"""
+        try:
+            with get_db_session() as session:
+                deleted_count = session.query(Payment).delete()
+                session.commit()
+                logging.info(f"Purged {deleted_count} payments")
+                return True
+        except Exception as e:
+            logging.error(f"Failed to purge payments: {e}")
+            return False
+
 
 class PaymentApi:
     def __init__(self, cache: Cache):
@@ -75,14 +149,18 @@ class PaymentApi:
         self.__fallback_payment_processor = os.getenv("FALLBACK_PAYMENT_PROCESSOR")
         self.cache = cache
         self.client = httpx.AsyncClient(timeout=10.0)
-    
+
     async def send_payment_default(self, payment: dict) -> int:
-        response = await self.client.post(f"{self.__default_payment_processor}/payments", json=payment)
+        response = await self.client.post(
+            f"{self.__default_payment_processor}/payments", json=payment
+        )
 
         return response.status_code
 
     async def send_payment_fallback(self, payment: dict) -> int:
-        response = await self.client.post(f"{self.__fallback_payment_processor}/payments", json=payment)
+        response = await self.client.post(
+            f"{self.__fallback_payment_processor}/payments", json=payment
+        )
 
         return response.status_code
 
@@ -94,29 +172,22 @@ class PaymentProcessor:
         self.repo = repo
         self.client = httpx.AsyncClient(
             timeout=httpx.Timeout(10.0),
-            limits=httpx.Limits(max_connections=20, max_keepalive_connections=10)
+            limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
         )
 
     async def process_single_payment(self, payment: dict) -> bool:
         """Process payment and add to buffer instead of immediate save"""
-        correlation_id = payment['correlationId']
 
         processor_type = self.health_manager.choose_best_processor()
 
         if await self._send_payment(payment, processor_type):
-            processed_payment = ProcessedPayment(
-                processor=processor_type,
-                **payment
-            )
+            processed_payment = ProcessedPayment(processor=processor_type, **payment)
             await self.payment_buffer.add_payment(processed_payment)
             return True
 
         alternative = "fallback" if processor_type == "default" else "default"
         if await self._send_payment(payment, alternative):
-            processed_payment = ProcessedPayment(
-                processor=alternative,
-                **payment
-            )
+            processed_payment = ProcessedPayment(processor=alternative, **payment)
             await self.payment_buffer.add_payment(processed_payment)
             return True
 
